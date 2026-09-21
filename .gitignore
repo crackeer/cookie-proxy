@@ -1,0 +1,6 @@
+/cookie-proxy
+/bin/
+/dist/
+/.kiro/
+config.json
+*.test

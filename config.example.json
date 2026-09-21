@@ -1,0 +1,17 @@
+{
+  "port": 8888,
+  "proxy_list": [
+    {
+      "name": "openclacky",
+      "proxy_pass": "http://10.33.207.152:7500"
+    },
+    {
+      "name": "deepseek",
+      "proxy_pass": "http://10.33.207.152:7501"
+    },
+    {
+      "name": "download",
+      "proxy_pass": "http://10.33.207.152:7502"
+    }
+  ]
+}
