@@ -324,6 +324,66 @@ func TestStripCookie(t *testing.T) {
 	}
 }
 
+// 后端 Set-Cookie 里的 Domain 属性会被去掉，让 Cookie 绑定到访问代理所用的主机；
+// 其它属性与其它 Cookie 都原样保留。
+func TestSetCookieDomainRewritten(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Set-Cookie", "sid=abc; Domain=backend.internal; Path=/; HttpOnly")
+		w.Header().Add("Set-Cookie", "theme=dark; Path=/")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	front := newFrontend(t, &config.Config{ProxyList: []config.Proxy{
+		{Name: "u", ProxyPass: backend.URL},
+	}}, nil)
+
+	resp := do(t, http.MethodGet, front.URL+"/login", "u", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d, 期望 200", resp.StatusCode)
+	}
+
+	got := resp.Header.Values("Set-Cookie")
+	if len(got) != 2 {
+		t.Fatalf("Set-Cookie 数量 = %d, 期望 2: %q", len(got), got)
+	}
+	for _, sc := range got {
+		if strings.Contains(strings.ToLower(sc), "domain=") {
+			t.Errorf("Set-Cookie 仍带 Domain 属性: %q", sc)
+		}
+	}
+	// 其它属性必须保留。
+	if !strings.Contains(got[0], "sid=abc") || !strings.Contains(got[0], "Path=/") || !strings.Contains(got[0], "HttpOnly") {
+		t.Errorf("第一条 Set-Cookie 的其它属性丢失: %q", got[0])
+	}
+	if got[1] != "theme=dark; Path=/" {
+		t.Errorf("第二条 Set-Cookie = %q, 期望原样保留", got[1])
+	}
+}
+
+func TestStripCookieDomainAttr(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"无 Domain 原样返回", "sid=abc; Path=/; HttpOnly", "sid=abc; Path=/; HttpOnly"},
+		{"删掉 Domain", "sid=abc; Domain=backend.internal; Path=/", "sid=abc; Path=/"},
+		{"Domain 大小写不敏感", "sid=abc; domain=.example.com; Secure", "sid=abc; Secure"},
+		{"Domain 在末尾", "sid=abc; Path=/; Domain=x.com", "sid=abc; Path=/"},
+		{"带前导空格的 Domain", "sid=abc;  Domain=x.com ; Path=/", "sid=abc; Path=/"},
+		{"cookie 名恰好叫 domain 时保留", "domain=abc; Path=/", "domain=abc; Path=/"},
+		{"只有 name=value", "sid=abc", "sid=abc"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := stripCookieDomainAttr(tc.in); got != tc.want {
+				t.Errorf("stripCookieDomainAttr(%q) = %q, 期望 %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 // 后端不可达 → 502，且响应体与日志都不泄露配置细节以外的信息。
 func TestUnreachableBackendReturns502(t *testing.T) {
 	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))

@@ -92,10 +92,11 @@ func (r *Router) build(cfg *config.Config) (*table, error) {
 				// 选择状态是本代理的内部实现，没必要让后端看到。
 				stripCookie(pr.Out, SelectionCookie)
 			},
-			Transport:     r.transport,
-			FlushInterval: -1, // 立即 flush，支持 SSE 与流式响应
-			ErrorHandler:  r.errorHandler(route, timeout),
-			ErrorLog:      slog.NewLogLogger(r.log.Handler(), slog.LevelError),
+			Transport:      r.transport,
+			FlushInterval:  -1, // 立即 flush，支持 SSE 与流式响应
+			ModifyResponse: rewriteSetCookieDomain,
+			ErrorHandler:   r.errorHandler(route, timeout),
+			ErrorLog:       slog.NewLogLogger(r.log.Handler(), slog.LevelError),
 		}
 		t.routes[p.Name] = route
 		t.order = append(t.order, route)
@@ -155,6 +156,49 @@ func stripCookie(req *http.Request, name string) {
 		return
 	}
 	req.Header["Cookie"] = kept
+}
+
+// rewriteSetCookieDomain 去掉后端 Set-Cookie 里的 Domain 属性。
+//
+// 后端往往按自己的主机名（例如 backend.internal）下发 Domain=...，而客户端是通过
+// 本代理的地址访问的，两者不一致会导致浏览器直接丢弃该 Cookie，登录态因此失效。
+// 去掉 Domain 后，Cookie 变成"仅限当前主机"（host-only），自动绑定到客户端访问
+// 本代理所用的主机，无论代理跑在哪个 host/port 都成立。这与 nginx
+// proxy_cookie_domain <backend> off 的效果一致。
+//
+// 其它属性（Path、Secure、HttpOnly、SameSite、Max-Age 等）保持原样。
+func rewriteSetCookieDomain(resp *http.Response) error {
+	raw := resp.Header.Values("Set-Cookie")
+	if len(raw) == 0 {
+		return nil
+	}
+	rewritten := make([]string, len(raw))
+	for i, sc := range raw {
+		rewritten[i] = stripCookieDomainAttr(sc)
+	}
+	resp.Header["Set-Cookie"] = rewritten
+	return nil
+}
+
+// stripCookieDomainAttr 从单条 Set-Cookie 头里删掉 Domain=... 属性，其余原样保留。
+// 属性以 ";" 分隔，属性名大小写不敏感（RFC 6265）。
+//
+// 第一段是 cookie 的 name=value，必须原样保留——即使 cookie 恰好叫 "domain"，
+// 那也是 cookie 名而不是 Domain 属性，只有从第二段起的才是属性。
+func stripCookieDomainAttr(setCookie string) string {
+	parts := strings.Split(setCookie, ";")
+	kept := make([]string, 0, len(parts))
+	for i, part := range parts {
+		if i > 0 {
+			attr := strings.TrimSpace(part)
+			if key, _, found := strings.Cut(attr, "="); found &&
+				strings.EqualFold(strings.TrimSpace(key), "domain") {
+				continue
+			}
+		}
+		kept = append(kept, part)
+	}
+	return strings.Join(kept, ";")
 }
 
 func newTransport() *http.Transport {

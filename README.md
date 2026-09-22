@@ -211,6 +211,10 @@ time=2026-09-21T17:44:27.952+08:00 level=INFO msg=access client_ip=127.0.0.1 met
 ## 转发行为
 
 - 方法、路径、查询串、请求头、请求体原样转发；响应状态码、响应头、响应体原样回传
+- 后端 `Set-Cookie` 里的 `Domain` 属性会被**去掉**：后端常按自己的主机名下发 `Domain=`，
+  与客户端访问本代理所用的主机不一致会被浏览器丢弃（登录态失效）。去掉后 Cookie 变成仅限
+  当前主机（host-only），自动绑定到客户端访问代理的主机；其它属性（`Path`/`Secure`/`HttpOnly`/
+  `SameSite`/`Max-Age` 等）保持不变。效果同 nginx `proxy_cookie_domain <backend> off`
 - `Host` 设为后端主机
 - 设置 `X-Forwarded-For` / `X-Forwarded-Host` / `X-Forwarded-Proto`，入站的同名头不被信任
 - `Authorization` 头原样透传给后端（本服务自己不再使用它）
