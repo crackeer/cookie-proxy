@@ -11,6 +11,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -34,23 +35,41 @@ type Route struct {
 	proxy *httputil.ReverseProxy
 }
 
-// Router 持有全部路由，运行期只读，因此并发访问无需加锁。
+// Router 持有全部路由。选择页增删改后端后会整体重建路由表，因此这里用原子指针
+// 发布快照：读的一侧（转发请求、渲染选择页）永远拿到一份完整且不再变化的表。
 type Router struct {
-	routes map[string]*Route
-	// order 保留配置里的书写顺序，供选择页按序展示。
+	snapshot atomic.Pointer[table]
+
+	// transport 在多次重建之间复用，避免改配置时丢掉已建立的连接池。
+	transport *http.Transport
+	log       *slog.Logger
+}
+
+// table 是一份不可变的路由快照：routes 供按名称查找，order 保留配置里的书写顺序。
+type table struct {
+	routes  map[string]*Route
 	order   []*Route
 	timeout time.Duration
-	log     *slog.Logger
 }
 
 // NewRouter 为每个后端预构建一个 ReverseProxy。
 func NewRouter(cfg *config.Config, log *slog.Logger) (*Router, error) {
-	transport := newTransport()
-	r := &Router{
+	r := &Router{transport: newTransport(), log: log}
+	t, err := r.build(cfg)
+	if err != nil {
+		return nil, err
+	}
+	r.snapshot.Store(t)
+	return r, nil
+}
+
+// build 按配置构造一份新的路由快照，不改变当前生效的路由表。
+func (r *Router) build(cfg *config.Config) (*table, error) {
+	timeout := time.Duration(cfg.UpstreamTimeoutSeconds) * time.Second
+	t := &table{
 		routes:  make(map[string]*Route, len(cfg.ProxyList)),
 		order:   make([]*Route, 0, len(cfg.ProxyList)),
-		timeout: time.Duration(cfg.UpstreamTimeoutSeconds) * time.Second,
-		log:     log,
+		timeout: timeout,
 	}
 
 	for i, p := range cfg.ProxyList {
@@ -58,7 +77,7 @@ func NewRouter(cfg *config.Config, log *slog.Logger) (*Router, error) {
 		if err != nil {
 			return nil, fmt.Errorf("proxy_list[%d].proxy_pass %q 解析失败: %w", i, p.ProxyPass, err)
 		}
-		if _, dup := r.routes[p.Name]; dup {
+		if _, dup := t.routes[p.Name]; dup {
 			return nil, fmt.Errorf("proxy_list[%d].name %q 重复", i, p.Name)
 		}
 
@@ -73,16 +92,35 @@ func NewRouter(cfg *config.Config, log *slog.Logger) (*Router, error) {
 				// 选择状态是本代理的内部实现，没必要让后端看到。
 				stripCookie(pr.Out, SelectionCookie)
 			},
-			Transport:     transport,
+			Transport:     r.transport,
 			FlushInterval: -1, // 立即 flush，支持 SSE 与流式响应
-			ErrorHandler:  r.errorHandler(route),
-			ErrorLog:      slog.NewLogLogger(log.Handler(), slog.LevelError),
+			ErrorHandler:  r.errorHandler(route, timeout),
+			ErrorLog:      slog.NewLogLogger(r.log.Handler(), slog.LevelError),
 		}
-		r.routes[p.Name] = route
-		r.order = append(r.order, route)
+		t.routes[p.Name] = route
+		t.order = append(t.order, route)
 	}
 
-	return r, nil
+	return t, nil
+}
+
+// Replace 用新配置整体替换路由表。构造新表失败时原表保持不变，
+// 因此调用方可以把它当作一次"要么全生效、要么不动"的操作。
+func (r *Router) Replace(cfg *config.Config) error {
+	t, err := r.build(cfg)
+	if err != nil {
+		return err
+	}
+	r.snapshot.Store(t)
+	return nil
+}
+
+// table 返回当前生效的路由快照。零值 Router 没有快照，返回空表而不是 panic。
+func (r *Router) table() *table {
+	if t := r.snapshot.Load(); t != nil {
+		return t
+	}
+	return &table{routes: map[string]*Route{}}
 }
 
 // stripCookie 从请求的 Cookie 头里摘掉指定的一个 Cookie，其余原样保留。
@@ -132,17 +170,17 @@ func newTransport() *http.Transport {
 	}
 }
 
-// Lookup 按名称查找路由。
+// Lookup 按名称查找当前生效的路由。
 func (r *Router) Lookup(name string) (*Route, bool) {
-	route, ok := r.routes[name]
+	route, ok := r.table().routes[name]
 	return route, ok
 }
 
-// Routes 按配置顺序返回全部路由，调用方只读。
-func (r *Router) Routes() []*Route { return r.order }
+// Routes 按配置顺序返回当前全部路由，调用方只读。
+func (r *Router) Routes() []*Route { return r.table().order }
 
 // Len 返回已加载的路由数量。
-func (r *Router) Len() int { return len(r.routes) }
+func (r *Router) Len() int { return len(r.table().routes) }
 
 // Handler 是兜底处理器：接受任意方法与路径，转发到已选定的后端。
 func (r *Router) Handler() gin.HandlerFunc {
@@ -160,8 +198,8 @@ func (r *Router) Handler() gin.HandlerFunc {
 
 		req := c.Request
 		// 协议升级（WebSocket 等）是长连接，套用上游超时会误杀。
-		if r.timeout > 0 && !isUpgrade(req) {
-			ctx, cancel := context.WithTimeout(req.Context(), r.timeout)
+		if t := r.table(); t.timeout > 0 && !isUpgrade(req) {
+			ctx, cancel := context.WithTimeout(req.Context(), t.timeout)
 			defer cancel()
 			req = req.WithContext(ctx)
 		}
@@ -170,7 +208,7 @@ func (r *Router) Handler() gin.HandlerFunc {
 	}
 }
 
-func (r *Router) errorHandler(route *Route) func(http.ResponseWriter, *http.Request, error) {
+func (r *Router) errorHandler(route *Route, timeout time.Duration) func(http.ResponseWriter, *http.Request, error) {
 	return func(w http.ResponseWriter, req *http.Request, err error) {
 		switch {
 		case errors.Is(err, context.Canceled):
@@ -180,7 +218,7 @@ func (r *Router) errorHandler(route *Route) func(http.ResponseWriter, *http.Requ
 		case errors.Is(err, context.DeadlineExceeded) || isTimeout(err):
 			r.log.Error("upstream timeout",
 				"proxy", route.Name, "upstream", route.Target, "path", req.URL.Path,
-				"timeout", r.timeout.String(), "err", err.Error())
+				"timeout", timeout.String(), "err", err.Error())
 			// 响应体保持通用，不泄露后端地址。
 			http.Error(w, "504 Gateway Timeout", http.StatusGatewayTimeout)
 		default:

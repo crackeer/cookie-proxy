@@ -4,12 +4,14 @@
 请求被转发到该条目的 `proxy_pass`。浏览器打开 `/_select` 就能在页面上挑选后端。
 
 - 一个入口端口，多个后端，靠一个 Cookie 切换
-- 自带选择页 `/_select`：列出全部后端，点一下写入 Cookie
-- 没选择时不会把请求发给任何后端（浏览器跳到选择页，其它客户端拿 403）
+- 自带选择页 `/_select`：用表格列出全部后端，点名称即写入 Cookie 并跳回原地址
+- 选择页上还能新增 / 修改 / 删除后端，直接写回 `config.json` 并立即生效（无需重启）
+- 没选择时不会把请求发给任何后端（一律跳转 `/_select`，用 `next` 记住原地址）
 - 基于 Gin，每个请求打印一条访问日志；日志不含 Cookie 原文与 `Authorization` 头
 
-> 注意：本服务不再做任何身份认证。凡是能访问这个端口的人都能选择任意后端，
-> 因此它只适合放在可信网络里，或者在前面串一层做认证的网关。
+> 注意：本服务不做任何身份认证。凡是能访问这个端口的人都既能选择任意后端，
+> **也能增删改后端**（等于可以把这个端口当任意地址的代理来用）。因此它只适合放在
+> 可信网络里，或者在前面串一层做认证的网关；不需要在线改配置时，用 `-readonly` 启动。
 
 ## 构建与运行
 
@@ -19,6 +21,13 @@ go build -o cookie-proxy .
 ```
 
 开发期可以直接 `go run . -c config.json`。
+
+命令行参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `-c FILE` | 必填，JSON 配置文件路径 |
+| `-readonly` | 选择页只读：不注册 `/_select` 的增删改接口，页面上也不显示入口 |
 
 ## 打包与部署（systemd）
 
@@ -58,6 +67,11 @@ journalctl -u cookie-proxy -f       # 跟踪日志（日志写 stdout，systemd 
 sudo systemctl restart cookie-proxy # 改完 /etc/cookie-proxy/config.json 后重启
 ```
 
+因为选择页会写回 `config.json`，装出来的配置目录与文件属于服务用户 `cookie-proxy`
+（目录 `0750`、文件 `0640`），unit 里也显式加上了 `ReadWritePaths=/etc/cookie-proxy`
+——否则 `ProtectSystem=strict` 会把 `/etc` 挂成只读，页面上改后端会报“创建临时文件失败”。
+如果是手工部署（不用 `install.sh`），要么给服务用户写权限，要么用 `-readonly` 启动。
+
 ## 配置
 
 `-c` 是必填参数，指向一个 JSON 文件：
@@ -96,6 +110,9 @@ sudo systemctl restart cookie-proxy # 改完 /etc/cookie-proxy/config.json 后�
 
 `proxy_pass` 带路径前缀时会与请求路径拼接：配置 `http://backend/base`，请求 `/x?q=1` → 后端收到 `/base/x?q=1`。
 
+在页面上增删改后端时，配置会被**重写**：注释会丢失，`upstream_timeout_seconds` 等未显式
+写出的字段会被补上默认值，`proxy_list` 的顺序保持页面上的顺序（新增的追加在末尾）。
+
 ## 使用
 
 浏览器：直接访问 `http://127.0.0.1:8888/` → 被带到 `/_select` → 选一个后端 → 自动跳回原来的地址。
@@ -107,16 +124,18 @@ sudo systemctl restart cookie-proxy # 改完 /etc/cookie-proxy/config.json 后�
 # 命中 openclacky 对应的后端
 curl -b 'proxy_name=openclacky' http://127.0.0.1:8888/hello.txt
 
-# 没带 Cookie → 403
+# 没带 Cookie → 302 到 /_select，并用 next 记住原地址（curl 用 -L 可自动跳过去挑选）
 curl -i http://127.0.0.1:8888/hello.txt
-
-# 浏览器式请求没带 Cookie → 302 到 /_select，并用 next 记住原地址
-curl -i -H 'Accept: text/html' http://127.0.0.1:8888/hello.txt
 ```
+
+非浏览器客户端也一样会被引导到选择页；`GET`/`HEAD` 以外的请求（如 `POST`）用 303 跳转，
+因为要明确告知客户端改用 `GET` 访问 `next`（原请求体不会保留）。
 
 ### 选择页 `/_select`
 
-- `GET /_select` 列出 `proxy_list` 的全部条目（名称 + 后端地址），当前选择会被标出
+- `GET /_select` 用表格列出 `proxy_list` 的全部条目（名称、后端地址、操作），当前选择会被标出
+  - 直接点名称即选中该后端（当前选中的也可点，用来跳回 `next`）；每行的「操作」列有「编辑」「删除」
+  - 可写模式下标题栏右侧还有「新增」按钮
 - `POST /_select`（表单字段 `name`、可选 `next`）写入 Cookie，然后 303 跳到 `next`
 - `next` 只接受本站绝对路径，外部地址与 `/_select` 自身都会被换成 `/`
 - 该路径由本服务处理，不会转发给后端；`GET`/`HEAD`/`POST` 之外的方法返回 405
@@ -124,27 +143,66 @@ curl -i -H 'Accept: text/html' http://127.0.0.1:8888/hello.txt
 Cookie 属性：`Path=/`、`Max-Age` 30 天、`HttpOnly`、`SameSite=Lax`，仅在 HTTPS 连接上附加 `Secure`。
 Cookie 的值在配置里不存在时（比如后端被删了），会被清除并重新引导到选择页。
 
+### 管理后端（增删改）
+
+表格里每一行的「操作」列有「编辑」和「删除」，标题栏右侧有「新增」。「编辑」和「新增」会
+弹出模态框（`<dialog>`）填写名称与后端地址，「删除」会先弹确认框再提交。提交后会：
+
+1. 先校验（名称非空且只含字母、数字、`.` `-` `_`，不能重名；地址必须是 `http://` 或 `https://` 绝对地址）；
+2. 校验通过才**原子写回** `config.json`（同目录临时文件 + `rename`，并继承原文件权限位）；
+3. 立即重建路由表，新后端马上可用，**不需要重启服务**。
+
+失败时页面顶部会显示原因（例如名称重复、地址非法、目录不可写），此时配置文件不会被改动。
+删除最后一条会被拒绝——配置要求至少保留一个后端。
+
+对应的接口（都是 `POST`，`application/x-www-form-urlencoded`）：
+
+| 接口 | 字段 | 说明 |
+| --- | --- | --- |
+| `/_select/add` | `name`、`proxy_pass` | 追加一条后端 |
+| `/_select/update` | `original_name`、`name`、`proxy_pass` | 改地址或改名；改名后如果当前选的正是这条，Cookie 会跟着改过去 |
+| `/_select/delete` | `name` | 删掉一条；删的正是当前选择时一并清掉 Cookie |
+
+三个接口都依次做两件事：
+
+- **同源检查**：带了 `Origin`（或 `Referer`）且主机与请求的 `Host` 不一致就返回 403，
+  用来挡住浏览器发起的跨站表单提交（CSRF）；curl 等不带这些头的不受影响。
+- **写回后 303 跳转**（PRG）：表单带了 `next` 就回到那个地址，否则留在选择页，
+  刷新页面不会重复提交。
+
+接口只在可写模式下注册；`-readonly` 启动时它们返回 404（而不是落到兜底转发）。
+`/_select` 下的未注册子路径一律 404，也不会被转发给后端。
+
+```bash
+# 用 curl 新增一条后端
+curl -i -X POST http://127.0.0.1:8888/_select/add \
+  -d 'name=local&proxy_pass=http://127.0.0.1:7601'
+```
+
 访问日志（`text` 格式）：
 
 ```
 time=2026-09-21T17:45:50.506+08:00 level=INFO msg=access client_ip=127.0.0.1 method=GET \
   path=/hello.txt status=200 duration_ms=2.046 bytes=10 proxy=alpha upstream=http://127.0.0.1:7601
 time=2026-09-21T17:44:27.952+08:00 level=INFO msg=access client_ip=127.0.0.1 method=GET \
-  path=/hello.txt status=403 duration_ms=0.051 bytes=129 proxy=- upstream="" reason=no_selection
+  path=/hello.txt status=302 duration_ms=0.051 bytes=0 proxy=- upstream="" reason=no_selection
 ```
 
-`reason` 只在未放行时出现，取值：`no_selection`（没带 Cookie）、`unknown_proxy_name`（名称不在配置里）。
-日志写标准输出，可直接交给容器或 systemd 收集。
+`reason` 只在未放行时出现，取值：`no_selection`（没带 Cookie）、`unknown_proxy_name`（名称不在配置里）、
+`admin_failed`（增删改被拒）、`cross_origin`（跨站修改请求被拒）。
+日志写标准输出，可直接交给容器或 systemd 收集。如需在日志里看到管理操作，搜 `msg="proxy added"` /
+`"proxy updated"` / `"proxy deleted"`。
 
 ## 状态码
 
 | 状态码 | 含义 |
 | --- | --- |
-| 302 | 浏览器请求缺少有效选择，跳转到 `/_select` |
-| 303 | 选择成功，跳回 `next` |
-| 403 | 非浏览器请求缺少有效选择；响应体说明怎么带 Cookie |
-| 400 | `POST /_select` 提交了不存在的名称，重新展示列表 |
-| 405 | 用 `GET`/`HEAD`/`POST` 之外的方法访问 `/_select` |
+| 302 | 缺少有效选择（`GET`/`HEAD`），跳转到 `/_select` |
+| 303 | 缺少有效选择的其它方法跳转，或选择成功/增删改成功后跳转 |
+| 403 | 管理接口收到跨站（`Origin`/`Referer` 不同源）的修改请求 |
+| 400 | `POST /_select` 提交了不存在的名称，或增删改校验失败（同一页重新展示列表） |
+| 404 | 只读模式下的写接口，或 `/_select` 下未注册的子路径 |
+| 405 | 用 `GET`/`HEAD`/`POST` 之外的方法访问 `/_select`；用非 `POST` 访问管理接口 |
 | 502 | 后端不可达（连接被拒、DNS 失败、TLS 错误等） |
 | 504 | 后端响应超过 `upstream_timeout_seconds` |
 | 500 | 服务内部异常（handler panic 已被恢复） |
@@ -159,19 +217,21 @@ time=2026-09-21T17:44:27.952+08:00 level=INFO msg=access client_ip=127.0.0.1 met
 - 转发前从 `Cookie` 头里摘掉 `proxy_name`，其它 Cookie 原样保留
 - 支持 WebSocket 升级与 SSE/分块流式响应（立即 flush）
 - 不做 307/301 路径改写：`/foo/` 这类尾斜杠路径原样转发
+- `/_select` 整个命名空间（含 `/_select/...` 子路径）由本服务保留，永远不会转发给后端
 
 ## 进程生命周期
 
 - 端口被占用、配置非法、配置文件读不到 → 打印错误并以非零退出码结束（缺 `-c` 退出码 2，其余为 1）
 - 收到 `SIGINT` / `SIGTERM` → 停止接收新连接，等待进行中的请求完成后退出；超过宽限期则强制关闭并打警告
+- 运行期改配置只发生在本服务的写接口里：先校验，再原子落盘，最后换路由表
 
 ## 不支持的场景
 
 - 身份认证：本服务只做选路，不校验任何凭据
 - 正向代理（`CONNECT`）：这是 ProxyPass 风格的反向代理
-- 配置热加载：改配置需重启
+- 从外部改动配置文件：只有本服务的写接口会重新加载路由表，手工改完文件仍需重启
 - 一个名称多后端 / 负载均衡
-- 后端占用 `/_select` 这个路径（它被本服务截获）
+- 后端占用 `/_select` 这个路径（整个 `/_select` 命名空间都被本服务截获）
 - TLS 终止：需要 HTTPS 时在前面放 nginx 或 ALB
 - `client_ip` 取真实对端地址，不解析入站 `X-Forwarded-For`；若本服务部署在别的反向代理之后，日志里的 IP 会是那个代理的地址
 
@@ -187,8 +247,8 @@ go test -race ./...
 ```
 build.sh                  # 交叉编译并打包为 systemd 安装包（含 unit 与 install.sh）
 main.go                    # flag 解析、中间件装配、监听与优雅退出
-internal/config            # 配置加载与校验
+internal/config            # 配置加载、校验、原子落盘与并发安全的 Store
 internal/logging           # slog 日志器与访问日志中间件
-internal/selector          # Cookie 选路中间件与 /_select 选择页
-internal/proxy             # 名称 → 后端路由表与请求转发
+internal/selector          # Cookie 选路中间件、/_select 选择页与增删改接口
+internal/proxy             # 名称 → 后端路由表（可原子替换）与请求转发
 ```

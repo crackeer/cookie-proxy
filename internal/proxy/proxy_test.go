@@ -31,6 +31,12 @@ func newFrontend(t *testing.T, cfg *config.Config, logOut io.Writer) *httptest.S
 	if err != nil {
 		t.Fatalf("NewRouter 失败: %v", err)
 	}
+	return newFrontendFor(t, router)
+}
+
+// newFrontendFor 用给定的 router 起服务，便于测试运行期替换路由表。
+func newFrontendFor(t *testing.T, router *Router) *httptest.Server {
+	t.Helper()
 
 	e := gin.New()
 	e.RedirectTrailingSlash = false
@@ -435,6 +441,129 @@ func TestNewRouterRejectsBadProxyPass(t *testing.T) {
 	if err == nil {
 		t.Fatal("期望解析失败")
 	}
+}
+
+// Replace 立刻换掉整张路由表：旧名称消失、新名称可用、顺序按新配置。
+func TestReplaceSwapsRoutes(t *testing.T) {
+	backendA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("A"))
+	}))
+	defer backendA.Close()
+	backendB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("B"))
+	}))
+	defer backendB.Close()
+
+	router, err := NewRouter(&config.Config{ProxyList: []config.Proxy{
+		{Name: "one", ProxyPass: backendA.URL},
+	}}, logging.NewWith(io.Discard, "text"))
+	if err != nil {
+		t.Fatalf("NewRouter 失败: %v", err)
+	}
+	front := newFrontendFor(t, router)
+
+	body := func(name string) (int, string) {
+		resp := do(t, http.MethodGet, front.URL+"/", name, nil)
+		got, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(got)
+	}
+
+	if status, got := body("one"); status != http.StatusOK || got != "A" {
+		t.Fatalf("替换前: status=%d body=%q", status, got)
+	}
+
+	if err := router.Replace(&config.Config{ProxyList: []config.Proxy{
+		{Name: "two", ProxyPass: backendB.URL},
+		{Name: "three", ProxyPass: backendA.URL},
+	}}); err != nil {
+		t.Fatalf("Replace 失败: %v", err)
+	}
+
+	if _, ok := router.Lookup("one"); ok {
+		t.Error("旧名称仍然存在")
+	}
+	if status, _ := body("one"); status == http.StatusOK {
+		t.Error("旧名称仍然可以转发")
+	}
+	if status, got := body("two"); status != http.StatusOK || got != "B" {
+		t.Errorf("新名称未生效: status=%d body=%q", status, got)
+	}
+
+	routes := router.Routes()
+	if len(routes) != 2 || router.Len() != 2 || routes[0].Name != "two" || routes[1].Name != "three" {
+		t.Errorf("路由表 = %+v (Len=%d), 期望 [two three]", routeNames(routes), router.Len())
+	}
+}
+
+// Replace 构造失败时必须保持原路由表可用。
+func TestReplaceFailureKeepsOldTable(t *testing.T) {
+	router, err := NewRouter(&config.Config{ProxyList: []config.Proxy{
+		{Name: "one", ProxyPass: "http://127.0.0.1:7500"},
+	}}, logging.NewWith(io.Discard, "text"))
+	if err != nil {
+		t.Fatalf("NewRouter 失败: %v", err)
+	}
+
+	bad := &config.Config{ProxyList: []config.Proxy{
+		{Name: "dup", ProxyPass: "http://127.0.0.1:7501"},
+		{Name: "dup", ProxyPass: "http://127.0.0.1:7502"},
+	}}
+	if err := router.Replace(bad); err == nil {
+		t.Fatal("期望重复名称导致失败")
+	}
+
+	route, ok := router.Lookup("one")
+	if !ok || route.Target != "http://127.0.0.1:7500" {
+		t.Errorf("失败后原路由表被破坏: ok=%v route=%+v", ok, route)
+	}
+	if _, ok := router.Lookup("dup"); ok {
+		t.Error("失败的表不应生效")
+	}
+}
+
+// 上游超时来自当前生效的那张表，替换后立即按新值生效。
+func TestReplaceAppliesNewTimeout(t *testing.T) {
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(3 * time.Second):
+			w.Write([]byte("late"))
+		case <-r.Context().Done():
+		}
+	}))
+	defer slow.Close()
+
+	router, err := NewRouter(&config.Config{
+		UpstreamTimeoutSeconds: 0, // 不限制
+		ProxyList:              []config.Proxy{{Name: "u", ProxyPass: slow.URL}},
+	}, logging.NewWith(io.Discard, "text"))
+	if err != nil {
+		t.Fatalf("NewRouter 失败: %v", err)
+	}
+	front := newFrontendFor(t, router)
+
+	if err := router.Replace(&config.Config{
+		UpstreamTimeoutSeconds: 1,
+		ProxyList:              []config.Proxy{{Name: "u", ProxyPass: slow.URL}},
+	}); err != nil {
+		t.Fatalf("Replace 失败: %v", err)
+	}
+
+	start := time.Now()
+	resp := do(t, http.MethodGet, front.URL+"/slow", "u", nil)
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("状态码 = %d, 期望 504", resp.StatusCode)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("耗时 %v，新的超时未生效", elapsed)
+	}
+}
+
+func routeNames(routes []*Route) []string {
+	names := make([]string, 0, len(routes))
+	for _, r := range routes {
+		names = append(names, r.Name)
+	}
+	return names
 }
 
 func TestIsUpgrade(t *testing.T) {

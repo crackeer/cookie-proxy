@@ -112,7 +112,7 @@ func (c *Config) Validate() error {
 			}
 		}
 
-		if err := validateProxyPass(p.ProxyPass); err != nil {
+		if err := ValidateProxyPass(p.ProxyPass); err != nil {
 			errs = append(errs, fmt.Errorf("proxy_list[%d].proxy_pass %q 无效：%w", i, p.ProxyPass, err))
 		}
 	}
@@ -120,7 +120,21 @@ func (c *Config) Validate() error {
 	return errors.Join(errs...)
 }
 
-func validateProxyPass(raw string) error {
+// ValidateName 校验单个名称，供表单等入口直接给出提示。
+// 规则与 Validate 里对 proxy_list[].name 的检查一致，只是措辞更贴近表单字段。
+func ValidateName(name string) error {
+	switch {
+	case name == "":
+		return errors.New("名称不能为空")
+	case !namePattern.MatchString(name):
+		return fmt.Errorf("名称 %q 无效：只允许字母、数字、. - _", name)
+	}
+	return nil
+}
+
+// ValidateProxyPass 校验单个后端地址：必须是 http:// 或 https:// 开头的绝对地址。
+// 表单提交与配置文件加载走同一套规则。
+func ValidateProxyPass(raw string) error {
 	if raw == "" {
 		return errors.New("不能为空")
 	}

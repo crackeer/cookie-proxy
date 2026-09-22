@@ -125,6 +125,8 @@ After=network-online.target
 Type=simple
 User=cookie-proxy
 Group=cookie-proxy
+# 选择页可以在页面上增删改后端（写回 config.json）。若要禁用，
+# 在下面这行末尾追加 -readonly。
 ExecStart=/usr/local/bin/cookie-proxy -c /etc/cookie-proxy/config.json
 Restart=on-failure
 RestartSec=3s
@@ -143,6 +145,9 @@ RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
+# ProtectSystem=strict 会把 /etc 挂成只读，这里显式放开配置目录，
+# 否则页面上改后端时会因为没有写权限而失败。
+ReadWritePaths=/etc/cookie-proxy
 
 [Install]
 WantedBy=multi-user.target
@@ -216,13 +221,20 @@ printf '==> 安装二进制到 %s/%s\n' "${BIN_DIR}" "${APP_NAME}"
 install -m 0755 "${SCRIPT_DIR}/${APP_NAME}" "${BIN_DIR}/${APP_NAME}"
 
 printf '==> 安装配置到 %s\n' "${CONF_DIR}"
-mkdir -p "${CONF_DIR}"
+# 服务会在选择页上增删改后端并写回 config.json，因此目录与文件都归服务用户，
+# 且目录必须可写——落盘用的是"同目录临时文件 + rename"，需要能创建/删除文件。
+install -d -m 0750 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${CONF_DIR}"
+chown "${SERVICE_USER}:${SERVICE_USER}" "${CONF_DIR}"
+chmod 0750 "${CONF_DIR}"
 if [[ -f "${CONF_DIR}/config.json" ]]; then
 	printf '    检测到已有配置：保留原文件，新配置另存为 config.json.new\n'
-	install -m 0640 -o root -g "${SERVICE_USER}" \
+	install -m 0640 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
 		"${SCRIPT_DIR}/config.json" "${CONF_DIR}/config.json.new"
+	# 旧版本装出来的配置属于 root，升级时改过来，否则页面上改不动。
+	chown "${SERVICE_USER}:${SERVICE_USER}" "${CONF_DIR}/config.json"
+	chmod 0640 "${CONF_DIR}/config.json"
 else
-	install -m 0640 -o root -g "${SERVICE_USER}" \
+	install -m 0640 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
 		"${SCRIPT_DIR}/config.json" "${CONF_DIR}/config.json"
 fi
 

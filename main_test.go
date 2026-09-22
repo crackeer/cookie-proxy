@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +17,20 @@ import (
 	"github.com/liuhu016/cookie-proxy/internal/proxy"
 	"github.com/liuhu016/cookie-proxy/internal/selector"
 )
+
+// newTestStore 把配置写进临时目录并返回可写的 Store。
+func newTestStore(t *testing.T, cfg *config.Config) *config.Store {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := config.Save(path, cfg); err != nil {
+		t.Fatalf("写入初始配置失败: %v", err)
+	}
+	loaded, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("加载初始配置失败: %v", err)
+	}
+	return config.NewStore(path, loaded)
+}
 
 func freePort(t *testing.T) string {
 	t.Helper()
@@ -136,7 +152,7 @@ func waitForListen(t *testing.T, addr string) {
 	t.Fatalf("服务未在预期时间内监听 %s", addr)
 }
 
-// buildEngine 的装配必须满足：未选择时不转发、选择页可用、选好后任意方法与路径都转发。
+// buildEngine 的装配必须满足：未选择时跳转到选择页、选择页可用、选好后任意方法与路径都转发。
 func TestBuildEngineWiring(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(r.Method + " " + r.URL.RequestURI()))
@@ -144,47 +160,44 @@ func TestBuildEngineWiring(t *testing.T) {
 	defer backend.Close()
 
 	log := logging.NewWith(io.Discard, "text")
-	router, err := proxy.NewRouter(&config.Config{
+	cfg := &config.Config{
+		Port:                   8888,
 		UpstreamTimeoutSeconds: 10,
+		LogFormat:              "text",
 		ProxyList: []config.Proxy{
 			{Name: "simple", ProxyPass: backend.URL},
 		},
-	}, log)
+	}
+	router, err := proxy.NewRouter(cfg, log)
 	if err != nil {
 		t.Fatalf("NewRouter 失败: %v", err)
 	}
 
-	front := httptest.NewServer(buildEngine(router, log))
+	front := httptest.NewServer(buildEngine(router, newTestStore(t, cfg), log))
 	defer front.Close()
 
 	client := &http.Client{
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 
-	t.Run("未选择时不转发", func(t *testing.T) {
-		resp, err := client.Get(front.URL + "/whatever")
-		if err != nil {
-			t.Fatalf("请求失败: %v", err)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusForbidden {
-			t.Errorf("状态码 = %d, 期望 403", resp.StatusCode)
-		}
-	})
-
-	t.Run("浏览器被引导到选择页", func(t *testing.T) {
-		req, _ := http.NewRequest(http.MethodGet, front.URL+"/whatever", nil)
-		req.Header.Set("Accept", "text/html")
-		resp, err := client.Do(req)
-		if err != nil {
-			t.Fatalf("请求失败: %v", err)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusFound {
-			t.Fatalf("状态码 = %d, 期望 302", resp.StatusCode)
-		}
-		if loc := resp.Header.Get("Location"); !strings.HasPrefix(loc, selector.Path) {
-			t.Errorf("Location = %q, 期望以 %s 开头", loc, selector.Path)
+	t.Run("未选择时至选择页", func(t *testing.T) {
+		// 浏览器与非浏览器客户端走同一条路，都只是被重定向。
+		for _, accept := range []string{"text/html", ""} {
+			req, _ := http.NewRequest(http.MethodGet, front.URL+"/whatever", nil)
+			if accept != "" {
+				req.Header.Set("Accept", accept)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("请求失败: %v", err)
+			}
+			if resp.StatusCode != http.StatusFound {
+				t.Fatalf("Accept=%q 状态码 = %d, 期望 302", accept, resp.StatusCode)
+			}
+			if loc := resp.Header.Get("Location"); !strings.HasPrefix(loc, selector.Path) {
+				t.Errorf("Accept=%q Location = %q, 期望以 %s 开头", accept, loc, selector.Path)
+			}
+			resp.Body.Close()
 		}
 	})
 
@@ -225,4 +238,93 @@ func TestBuildEngineWiring(t *testing.T) {
 			}
 		}
 	})
+}
+
+// 端到端：在运行中的服务上新增后端，新后端立即可以转发。
+func TestBuildEngineAllowsEditingProxies(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(r.Method + " " + r.URL.RequestURI()))
+	}))
+	defer backend.Close()
+
+	log := logging.NewWith(io.Discard, "text")
+	cfg := &config.Config{
+		Port:                   8888,
+		UpstreamTimeoutSeconds: 10,
+		LogFormat:              "text",
+		ProxyList:              []config.Proxy{{Name: "simple", ProxyPass: "http://127.0.0.1:9"}},
+	}
+	router, err := proxy.NewRouter(cfg, log)
+	if err != nil {
+		t.Fatalf("NewRouter 失败: %v", err)
+	}
+
+	front := httptest.NewServer(buildEngine(router, newTestStore(t, cfg), log))
+	defer front.Close()
+
+	client := &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+
+	resp, err := client.PostForm(front.URL+selector.AddPath,
+		url.Values{"name": {"added"}, "proxy_pass": {backend.URL}})
+	if err != nil {
+		t.Fatalf("新增请求失败: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("新增状态码 = %d, 期望 303", resp.StatusCode)
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, front.URL+"/hello", nil)
+	req.AddCookie(&http.Cookie{Name: selector.CookieName, Value: "added"})
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("转发请求失败: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || string(body) != "GET /hello" {
+		t.Errorf("新后端未生效: status=%d body=%q", resp.StatusCode, body)
+	}
+}
+
+// 只读模式（store 为 nil）下不能增删改。
+func TestBuildEngineReadonly(t *testing.T) {
+	log := logging.NewWith(io.Discard, "text")
+	cfg := &config.Config{
+		Port:      8888,
+		LogFormat: "text",
+		ProxyList: []config.Proxy{{Name: "simple", ProxyPass: "http://127.0.0.1:9"}},
+	}
+	router, err := proxy.NewRouter(cfg, log)
+	if err != nil {
+		t.Fatalf("NewRouter 失败: %v", err)
+	}
+
+	front := httptest.NewServer(buildEngine(router, nil, log))
+	defer front.Close()
+
+	client := &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	resp, err := client.PostForm(front.URL+selector.AddPath,
+		url.Values{"name": {"added"}, "proxy_pass": {"http://127.0.0.1:9"}})
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("状态码 = %d, 期望 404", resp.StatusCode)
+	}
+
+	page, err := client.Get(front.URL + selector.Path)
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	defer page.Body.Close()
+	body, _ := io.ReadAll(page.Body)
+	if strings.Contains(string(body), selector.AddPath) {
+		t.Errorf("只读页面不应出现增删改入口:\n%s", body)
+	}
 }

@@ -56,14 +56,14 @@ func TestAccessLogRequestWithoutSelection(t *testing.T) {
 	e.Use(AccessLog(log))
 	e.GET("/", func(c *gin.Context) {
 		c.Set(CtxKeyReason, "no_selection")
-		c.String(http.StatusForbidden, "403 Forbidden")
+		c.Redirect(http.StatusFound, "/_select")
 	})
 
 	w := httptest.NewRecorder()
 	e.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/", nil))
 
 	out := buf.String()
-	for _, want := range []string{"status=403", "proxy=-", "reason=no_selection", `upstream=""`} {
+	for _, want := range []string{"status=302", "proxy=-", "reason=no_selection", `upstream=""`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("日志缺少 %q:\n%s", want, out)
 		}

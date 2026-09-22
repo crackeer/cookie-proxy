@@ -26,6 +26,7 @@ import (
 
 func main() {
 	cfgPath := flag.String("c", "", "JSON 配置文件路径（必填）")
+	readonly := flag.Bool("readonly", false, "选择页只读：不注册 /_select 的增删改接口")
 	flag.Parse()
 
 	if *cfgPath == "" {
@@ -48,9 +49,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 可写模式下把配置文件交给 Store 统一读写；只读模式传 nil。
+	var store *config.Store
+	if !*readonly {
+		store = config.NewStore(*cfgPath, cfg)
+	}
+	log.Info("config loaded", "path", *cfgPath, "proxies", len(cfg.ProxyList), "editable", store != nil)
+
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),
-		Handler:           buildEngine(router, log),
+		Handler:           buildEngine(router, store, log),
 		ReadHeaderTimeout: 20 * time.Second,
 	}
 
@@ -65,7 +73,8 @@ func main() {
 }
 
 // buildEngine 组装中间件链：访问日志 → panic 恢复 → Cookie 选路 → 转发。
-func buildEngine(router *proxy.Router, log *slog.Logger) *gin.Engine {
+// store 为 nil 时 /_select 只读。
+func buildEngine(router *proxy.Router, store *config.Store, log *slog.Logger) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 
 	e := gin.New()
@@ -78,7 +87,7 @@ func buildEngine(router *proxy.Router, log *slog.Logger) *gin.Engine {
 	// 不信任入站 X-Forwarded-For，ClientIP 取真实对端地址。
 	_ = e.SetTrustedProxies(nil)
 
-	sel := selector.New(router, log)
+	sel := selector.New(router, store, log)
 	e.Use(logging.AccessLog(log), gin.Recovery(), sel.Middleware())
 	// /_select 是本服务自己的页面，不转发。
 	sel.Register(e)
