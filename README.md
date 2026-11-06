@@ -102,6 +102,7 @@ sudo systemctl restart cookie-proxy # 改完 /etc/cookie-proxy/config.json 后�
 | `proxy_list[].name` | 是 | — | Cookie `proxy_name` 的取值，不可重复；只允许字母、数字、`.` `-` `_` |
 | `proxy_list[].proxy_pass` | 是 | — | 后端地址，必须是 `http://` 或 `https://` 开头的绝对地址，可带路径前缀 |
 | `upstream_timeout_seconds` | 否 | `30` | 转发超时；`0` 或负数表示不限制。协议升级请求（WebSocket）不受此限制 |
+| `upstream_insecure_skip_verify` | 否 | `false` | 为 `true` 时不校验 `https://` 后端的证书（自签名、内网 CA），对所有后端生效；也可在选择页上切换，立即生效 |
 | `shutdown_timeout_seconds` | 否 | `10` | 优雅退出的宽限期 |
 | `log_format` | 否 | `"text"` | `"text"` 或 `"json"` |
 
@@ -155,6 +156,9 @@ Cookie 的值在配置里不存在时（比如后端被删了），会被清除�
 失败时页面顶部会显示原因（例如名称重复、地址非法、目录不可写），此时配置文件不会被改动。
 删除最后一条会被拒绝——配置要求至少保留一个后端。
 
+表格下方显示 https 后端证书校验的当前状态（关闭时以黄色提示），可写模式下旁边有
+「关闭校验」/「开启校验」按钮，切换后同样写回 `config.json` 并立即生效。
+
 对应的接口（都是 `POST`，`application/x-www-form-urlencoded`）：
 
 | 接口 | 字段 | 说明 |
@@ -162,8 +166,9 @@ Cookie 的值在配置里不存在时（比如后端被删了），会被清除�
 | `/_select/add` | `name`、`proxy_pass` | 追加一条后端 |
 | `/_select/update` | `original_name`、`name`、`proxy_pass` | 改地址或改名；改名后如果当前选的正是这条，Cookie 会跟着改过去 |
 | `/_select/delete` | `name` | 删掉一条；删的正是当前选择时一并清掉 Cookie |
+| `/_select/tls` | `insecure_skip_verify`（`true`/`false`） | 关闭或开启 https 后端的证书校验 |
 
-三个接口都依次做两件事：
+这些接口都依次做两件事：
 
 - **同源检查**：带了 `Origin`（或 `Referer`）且主机与请求的 `Host` 不一致就返回 403，
   用来挡住浏览器发起的跨站表单提交（CSRF）；curl 等不带这些头的不受影响。

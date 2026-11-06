@@ -9,9 +9,10 @@
 //   - POST /_select/add      新增一个后端
 //   - POST /_select/update   修改一个后端（可改名）
 //   - POST /_select/delete   删除一个后端
+//   - POST /_select/tls      开关 https 后端的证书校验
 //
 // 增删改会写回配置文件并立即重建路由表；Store 为 nil 时页面只读，
-// 三个写接口不注册（访问返回 404）。
+// 写接口不注册（访问返回 404）。
 package selector
 
 import (
@@ -36,6 +37,7 @@ const (
 	AddPath    = Path + "/add"
 	UpdatePath = Path + "/update"
 	DeletePath = Path + "/delete"
+	TLSPath    = Path + "/tls"
 	// adminPrefix 是 /_select 下保留给本服务的命名空间。
 	adminPrefix = Path + "/"
 
@@ -60,6 +62,7 @@ var adminActions = map[string]bool{
 	AddPath:    true,
 	UpdatePath: true,
 	DeletePath: true,
+	TLSPath:    true,
 }
 
 // Selector 持有路由表的只读视图；store 非空时可写（可增删改后端）。
@@ -89,6 +92,7 @@ func (s *Selector) Register(e *gin.Engine) {
 	e.POST(AddPath, s.addProxy)
 	e.POST(UpdatePath, s.updateProxy)
 	e.POST(DeletePath, s.deleteProxy)
+	e.POST(TLSPath, s.setTLSVerify)
 }
 
 // Middleware 读取 Cookie 并把命中的路由写入 gin.Context。
@@ -303,6 +307,40 @@ func (s *Selector) deleteProxy(c *gin.Context) {
 	s.done(c)
 }
 
+// setTLSVerify 开关 https 后端的证书校验。表单字段 insecure_skip_verify 取 "true" 或 "false"。
+func (s *Selector) setTLSVerify(c *gin.Context) {
+	if !s.checkOrigin(c) {
+		return
+	}
+
+	var skip bool
+	switch c.PostForm("insecure_skip_verify") {
+	case "true":
+		skip = true
+	case "false":
+	default:
+		s.fail(c, `修改失败：insecure_skip_verify 只能是 "true" 或 "false"`)
+		return
+	}
+
+	next, err := s.store.Update(func(cfg *config.Config) error {
+		cfg.UpstreamInsecureSkipVerify = skip
+		return nil
+	})
+	if err != nil {
+		s.fail(c, "修改失败："+err.Error())
+		return
+	}
+
+	s.publish(next)
+	if skip {
+		s.log.Warn("upstream TLS certificate verification disabled", "upstream_insecure_skip_verify", true)
+	} else {
+		s.log.Info("upstream TLS certificate verification enabled", "upstream_insecure_skip_verify", false)
+	}
+	s.done(c)
+}
+
 // publish 用新配置重建路由表。Update 已经过完整校验，这里失败只可能是内部错误；
 // 此时配置已落盘，重启后仍会按新配置生效，所以只记录不回滚。
 func (s *Selector) publish(cfg *config.Config) {
@@ -404,6 +442,10 @@ type pageData struct {
 	AddAction    string
 	UpdateAction string
 	DeleteAction string
+	TLSAction    string
+
+	// InsecureSkipVerify 为 true 表示 https 后端当前不校验证书。
+	InsecureSkipVerify bool
 }
 
 func (s *Selector) render(c *gin.Context, status int, next, errMsg string) {
@@ -422,7 +464,10 @@ func (s *Selector) render(c *gin.Context, status int, next, errMsg string) {
 		AddAction:    AddPath,
 		UpdateAction: UpdatePath,
 		DeleteAction: DeletePath,
+		TLSAction:    TLSPath,
 		Options:      make([]option, 0, len(routes)),
+
+		InsecureSkipVerify: s.router.InsecureSkipVerify(),
 	}
 	for _, route := range routes {
 		selected := route.Name == current
@@ -575,6 +620,13 @@ var pageTmpl = template.Must(template.New("select").Parse(`<!DOCTYPE html>
   .dialog-body { padding: 1.25rem; }
   .dialog-body h2 { margin: 0 0 1rem; }
   .dialog-actions { display: flex; justify-content: flex-end; gap: .5rem; margin-top: 1.1rem; }
+  .settings {
+    display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+    margin-top: 1rem; padding: .7rem .85rem; border-radius: 10px;
+    background: #fff; border: 1px solid #d7dae1; font-size: .875rem;
+  }
+  .settings.warn { background: #fff6e5; border-color: #f0cf8a; color: #6b4a00; }
+  .settings form { margin: 0; }
   @media (prefers-color-scheme: dark) {
     body { background: #16181d; color: #e6e8ec; }
     .hint, form.stack label, thead th, .target { color: #9aa1ad; }
@@ -589,6 +641,8 @@ var pageTmpl = template.Must(template.New("select").Parse(`<!DOCTYPE html>
     input, dialog { background: #16181d; border-color: #343943; }
     dialog { color: #e6e8ec; }
     .btn-danger-link { color: #f4a2a2; }
+    .settings { background: #1f2229; border-color: #343943; }
+    .settings.warn { background: #3a2f17; border-color: #6b5420; color: #f3d9a0; }
   }
 </style>
 </head>
@@ -638,6 +692,21 @@ var pageTmpl = template.Must(template.New("select").Parse(`<!DOCTYPE html>
     {{end}}
     </tbody>
   </table>
+  <div class="settings{{if .InsecureSkipVerify}} warn{{end}}">
+    <span>https 后端证书校验：{{if .InsecureSkipVerify}}<strong>已关闭</strong>（自签名证书也会被接受）{{else}}已开启{{end}}</span>
+    {{if .Editable}}
+    <form method="post" action="{{.TLSAction}}">
+      <input type="hidden" name="next" value="{{.Next}}">
+      {{if .InsecureSkipVerify}}
+      <input type="hidden" name="insecure_skip_verify" value="false">
+      <button type="submit" class="btn btn-ghost">开启校验</button>
+      {{else}}
+      <input type="hidden" name="insecure_skip_verify" value="true">
+      <button type="submit" class="btn btn-ghost">关闭校验</button>
+      {{end}}
+    </form>
+    {{end}}
+  </div>
   {{if .Editable}}
   <dialog id="add-dialog">
     <form class="stack" method="post" action="{{.AddAction}}" style="margin:0">

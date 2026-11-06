@@ -55,6 +55,9 @@ func main() {
 		store = config.NewStore(*cfgPath, cfg)
 	}
 	log.Info("config loaded", "path", *cfgPath, "proxies", len(cfg.ProxyList), "editable", store != nil)
+	if cfg.UpstreamInsecureSkipVerify {
+		log.Warn("upstream TLS certificate verification disabled", "upstream_insecure_skip_verify", true)
+	}
 
 	srv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),

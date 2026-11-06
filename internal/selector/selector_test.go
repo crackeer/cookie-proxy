@@ -770,6 +770,7 @@ func TestReadonlyModeHasNoWriteEndpoints(t *testing.T) {
 		{http.MethodPost, AddPath},
 		{http.MethodPost, UpdatePath},
 		{http.MethodPost, DeletePath},
+		{http.MethodPost, TLSPath},
 	} {
 		resp := request(t, tc.method, st.front.URL+tc.path,
 			http.Header{
@@ -780,6 +781,72 @@ func TestReadonlyModeHasNoWriteEndpoints(t *testing.T) {
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("%s %s 状态码 = %d, 期望 404", tc.method, tc.path, resp.StatusCode)
 		}
+	}
+}
+
+// 页面上切换证书校验：写回配置、立即生效、页面状态同步。
+func TestTLSVerifyToggle(t *testing.T) {
+	var logBuf syncBuffer
+	st := newStack(t, true, &logBuf)
+
+	tlsBackend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("tls ok"))
+	}))
+	t.Cleanup(tlsBackend.Close)
+
+	if resp := formPost(t, st.front.URL+AddPath,
+		url.Values{"name": {"secure"}, "proxy_pass": {tlsBackend.URL}}); resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("新增状态码 = %d, 期望 303", resp.StatusCode)
+	}
+
+	get := func() int {
+		resp := request(t, http.MethodGet, st.front.URL+"/",
+			http.Header{"Cookie": {CookieName + "=secure"}}, nil)
+		return resp.StatusCode
+	}
+	page := func() string {
+		body, _ := io.ReadAll(request(t, http.MethodGet, st.front.URL+Path, nil, nil).Body)
+		return string(body)
+	}
+	toggle := func(v string) {
+		t.Helper()
+		resp := formPost(t, st.front.URL+TLSPath, url.Values{"insecure_skip_verify": {v}})
+		if resp.StatusCode != http.StatusSeeOther {
+			t.Fatalf("切换为 %s 状态码 = %d, 期望 303", v, resp.StatusCode)
+		}
+	}
+
+	// 默认校验证书：自签名后端 502。
+	if status := get(); status != http.StatusBadGateway {
+		t.Fatalf("默认状态码 = %d, 期望 502", status)
+	}
+	if p := page(); !strings.Contains(p, "已开启") || !strings.Contains(p, "关闭校验") {
+		t.Error("页面未显示校验已开启")
+	}
+
+	toggle("true")
+	if !st.loadCfg(t).UpstreamInsecureSkipVerify {
+		t.Error("配置文件未写入 upstream_insecure_skip_verify=true")
+	}
+	if status := get(); status != http.StatusOK {
+		t.Errorf("关闭校验后状态码 = %d, 期望 200", status)
+	}
+	if p := page(); !strings.Contains(p, "已关闭") || !strings.Contains(p, "开启校验") {
+		t.Error("页面未显示校验已关闭")
+	}
+	waitForLog(t, &logBuf, "verification disabled")
+
+	toggle("false")
+	if st.loadCfg(t).UpstreamInsecureSkipVerify {
+		t.Error("配置文件未写回 upstream_insecure_skip_verify=false")
+	}
+	if status := get(); status != http.StatusBadGateway {
+		t.Errorf("重新开启校验后状态码 = %d, 期望 502", status)
+	}
+
+	// 非法取值不改配置。
+	if resp := formPost(t, st.front.URL+TLSPath, url.Values{"insecure_skip_verify": {"yes"}}); resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("非法取值状态码 = %d, 期望 400", resp.StatusCode)
 	}
 }
 

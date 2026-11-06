@@ -29,6 +29,8 @@ type Config struct {
 
 	// UpstreamTimeoutSeconds 为转发到后端的超时时间，0 表示不限制。
 	UpstreamTimeoutSeconds int `json:"upstream_timeout_seconds"`
+	// UpstreamInsecureSkipVerify 为 true 时不校验 https 后端的证书（自签名、内网 CA 等）。
+	UpstreamInsecureSkipVerify bool `json:"upstream_insecure_skip_verify"`
 	// ShutdownTimeoutSeconds 为优雅退出的宽限期。
 	ShutdownTimeoutSeconds int `json:"shutdown_timeout_seconds"`
 	// LogFormat 取 "text" 或 "json"。

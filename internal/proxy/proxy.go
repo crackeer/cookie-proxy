@@ -3,6 +3,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -40,9 +41,12 @@ type Route struct {
 type Router struct {
 	snapshot atomic.Pointer[table]
 
-	// transport 在多次重建之间复用，避免改配置时丢掉已建立的连接池。
-	transport *http.Transport
-	log       *slog.Logger
+	// 两个 Transport 在多次重建之间复用，避免改配置时丢掉已建立的连接池。
+	// 校验与不校验证书各用一个：连接池分开，重新开启校验后不会复用
+	// 之前未经校验建立的 TLS 连接。
+	transport         *http.Transport
+	insecureTransport *http.Transport
+	log               *slog.Logger
 }
 
 // table 是一份不可变的路由快照：routes 供按名称查找，order 保留配置里的书写顺序。
@@ -50,11 +54,17 @@ type table struct {
 	routes  map[string]*Route
 	order   []*Route
 	timeout time.Duration
+	// insecureSkipVerify 为 true 时 https 后端不校验证书。
+	insecureSkipVerify bool
 }
 
 // NewRouter 为每个后端预构建一个 ReverseProxy。
 func NewRouter(cfg *config.Config, log *slog.Logger) (*Router, error) {
-	r := &Router{transport: newTransport(), log: log}
+	r := &Router{
+		transport:         newTransport(false),
+		insecureTransport: newTransport(true),
+		log:               log,
+	}
 	t, err := r.build(cfg)
 	if err != nil {
 		return nil, err
@@ -67,9 +77,14 @@ func NewRouter(cfg *config.Config, log *slog.Logger) (*Router, error) {
 func (r *Router) build(cfg *config.Config) (*table, error) {
 	timeout := time.Duration(cfg.UpstreamTimeoutSeconds) * time.Second
 	t := &table{
-		routes:  make(map[string]*Route, len(cfg.ProxyList)),
-		order:   make([]*Route, 0, len(cfg.ProxyList)),
-		timeout: timeout,
+		routes:             make(map[string]*Route, len(cfg.ProxyList)),
+		order:              make([]*Route, 0, len(cfg.ProxyList)),
+		timeout:            timeout,
+		insecureSkipVerify: cfg.UpstreamInsecureSkipVerify,
+	}
+	transport := r.transport
+	if t.insecureSkipVerify {
+		transport = r.insecureTransport
 	}
 
 	for i, p := range cfg.ProxyList {
@@ -92,7 +107,7 @@ func (r *Router) build(cfg *config.Config) (*table, error) {
 				// 选择状态是本代理的内部实现，没必要让后端看到。
 				stripCookie(pr.Out, SelectionCookie)
 			},
-			Transport:      r.transport,
+			Transport:      transport,
 			FlushInterval:  -1, // 立即 flush，支持 SSE 与流式响应
 			ModifyResponse: rewriteSetCookieDomain,
 			ErrorHandler:   r.errorHandler(route, timeout),
@@ -113,6 +128,10 @@ func (r *Router) Replace(cfg *config.Config) error {
 		return err
 	}
 	r.snapshot.Store(t)
+	if !t.insecureSkipVerify {
+		// 重新开启校验后，未经校验建立的空闲连接不再有用，及时释放。
+		r.insecureTransport.CloseIdleConnections()
+	}
 	return nil
 }
 
@@ -201,11 +220,13 @@ func stripCookieDomainAttr(setCookie string) string {
 	return strings.Join(kept, ";")
 }
 
-func newTransport() *http.Transport {
+// newTransport 构造后端共用的 Transport；insecureSkipVerify 为 true 时不校验 https 后端证书。
+func newTransport(insecureSkipVerify bool) *http.Transport {
 	return &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		ForceAttemptHTTP2:     true,
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: insecureSkipVerify}, //nolint:gosec // 由配置显式开启
 		MaxIdleConns:          200,
 		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       90 * time.Second,
@@ -225,6 +246,9 @@ func (r *Router) Routes() []*Route { return r.table().order }
 
 // Len 返回已加载的路由数量。
 func (r *Router) Len() int { return len(r.table().routes) }
+
+// InsecureSkipVerify 返回当前生效的路由表是否跳过 https 后端的证书校验。
+func (r *Router) InsecureSkipVerify() bool { return r.table().insecureSkipVerify }
 
 // Handler 是兜底处理器：接受任意方法与路径，转发到已选定的后端。
 func (r *Router) Handler() gin.HandlerFunc {
