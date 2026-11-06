@@ -143,6 +143,14 @@ func TestCloneIsDeep(t *testing.T) {
 	if cfg.Port == 9999 || cfg.ProxyList[0].Name == "changed" {
 		t.Errorf("修改副本影响到了原对象: %+v", cfg)
 	}
+
+	skip := true
+	cfg.UpstreamInsecureSkipVerify = &skip
+	dup = cfg.Clone()
+	*dup.UpstreamInsecureSkipVerify = false
+	if !*cfg.UpstreamInsecureSkipVerify {
+		t.Error("修改副本的 UpstreamInsecureSkipVerify 影响到了原对象")
+	}
 }
 
 // Update 成功时落盘并更新内存；失败时两者都不变。

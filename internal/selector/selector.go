@@ -324,7 +324,7 @@ func (s *Selector) setTLSVerify(c *gin.Context) {
 	}
 
 	next, err := s.store.Update(func(cfg *config.Config) error {
-		cfg.UpstreamInsecureSkipVerify = skip
+		cfg.UpstreamInsecureSkipVerify = &skip
 		return nil
 	})
 	if err != nil {

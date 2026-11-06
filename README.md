@@ -102,7 +102,7 @@ sudo systemctl restart cookie-proxy # 改完 /etc/cookie-proxy/config.json 后�
 | `proxy_list[].name` | 是 | — | Cookie `proxy_name` 的取值，不可重复；只允许字母、数字、`.` `-` `_` |
 | `proxy_list[].proxy_pass` | 是 | — | 后端地址，必须是 `http://` 或 `https://` 开头的绝对地址，可带路径前缀 |
 | `upstream_timeout_seconds` | 否 | `30` | 转发超时；`0` 或负数表示不限制。协议升级请求（WebSocket）不受此限制 |
-| `upstream_insecure_skip_verify` | 否 | `false` | 为 `true` 时不校验 `https://` 后端的证书（自签名、内网 CA），对所有后端生效；也可在选择页上切换，立即生效 |
+| `upstream_insecure_skip_verify` | 否 | `true` | 默认不校验 `https://` 后端的证书（自签名、内网 CA 可直接用）；显式设为 `false` 才开启校验。对所有后端生效；也可在选择页上切换，立即生效 |
 | `shutdown_timeout_seconds` | 否 | `10` | 优雅退出的宽限期 |
 | `log_format` | 否 | `"text"` | `"text"` 或 `"json"` |
 

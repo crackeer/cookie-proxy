@@ -582,20 +582,22 @@ func TestReplaceFailureKeepsOldTable(t *testing.T) {
 }
 
 // 上游超时来自当前生效的那张表，替换后立即按新值生效。
-// https 后端用自签名证书：默认校验失败返回 502，开启 upstream_insecure_skip_verify 后可正常转发。
+// https 后端用自签名证书：默认跳过校验可直接转发，显式开启校验后握手失败返回 502。
 func TestHTTPSUpstreamInsecureSkipVerify(t *testing.T) {
 	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("tls ok"))
 	}))
 	defer backend.Close()
 
+	boolPtr := func(b bool) *bool { return &b }
 	for _, tc := range []struct {
 		name       string
-		skipVerify bool
+		skipVerify *bool // nil 表示不配置，走默认值
 		wantStatus int
 	}{
-		{"默认校验证书", false, http.StatusBadGateway},
-		{"跳过校验", true, http.StatusOK},
+		{"默认跳过校验", nil, http.StatusOK},
+		{"显式开启校验", boolPtr(false), http.StatusBadGateway},
+		{"显式跳过校验", boolPtr(true), http.StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			front := newFrontend(t, &config.Config{

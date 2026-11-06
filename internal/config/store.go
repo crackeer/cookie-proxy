@@ -13,6 +13,10 @@ func (c *Config) Clone() *Config {
 	dup := *c
 	dup.ProxyList = make([]Proxy, len(c.ProxyList))
 	copy(dup.ProxyList, c.ProxyList)
+	if c.UpstreamInsecureSkipVerify != nil {
+		skip := *c.UpstreamInsecureSkipVerify
+		dup.UpstreamInsecureSkipVerify = &skip
+	}
 	return &dup
 }
 

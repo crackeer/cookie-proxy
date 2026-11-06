@@ -13,9 +13,10 @@ import (
 
 // 可选字段的默认值。
 const (
-	DefaultUpstreamTimeoutSeconds = 30
-	DefaultShutdownTimeoutSeconds = 10
-	DefaultLogFormat              = "text"
+	DefaultUpstreamTimeoutSeconds     = 30
+	DefaultShutdownTimeoutSeconds     = 10
+	DefaultLogFormat                  = "text"
+	DefaultUpstreamInsecureSkipVerify = true
 )
 
 // namePattern 限制 name 的取值：它既要放进 Cookie 值，也要出现在页面上，
@@ -30,7 +31,8 @@ type Config struct {
 	// UpstreamTimeoutSeconds 为转发到后端的超时时间，0 表示不限制。
 	UpstreamTimeoutSeconds int `json:"upstream_timeout_seconds"`
 	// UpstreamInsecureSkipVerify 为 true 时不校验 https 后端的证书（自签名、内网 CA 等）。
-	UpstreamInsecureSkipVerify bool `json:"upstream_insecure_skip_verify"`
+	// 用指针区分"未配置"与显式 false：未配置时取默认值 true（默认跳过校验）。
+	UpstreamInsecureSkipVerify *bool `json:"upstream_insecure_skip_verify,omitempty"`
 	// ShutdownTimeoutSeconds 为优雅退出的宽限期。
 	ShutdownTimeoutSeconds int `json:"shutdown_timeout_seconds"`
 	// LogFormat 取 "text" 或 "json"。
@@ -73,12 +75,24 @@ func (c *Config) applyDefaults() {
 		// 负数视为"不限制"，统一归一化为 0。
 		c.UpstreamTimeoutSeconds = 0
 	}
+	if c.UpstreamInsecureSkipVerify == nil {
+		skip := DefaultUpstreamInsecureSkipVerify
+		c.UpstreamInsecureSkipVerify = &skip
+	}
 	if c.ShutdownTimeoutSeconds <= 0 {
 		c.ShutdownTimeoutSeconds = DefaultShutdownTimeoutSeconds
 	}
 	if c.LogFormat == "" {
 		c.LogFormat = DefaultLogFormat
 	}
+}
+
+// SkipVerify 返回是否跳过 https 后端的证书校验；未配置时取默认值。
+func (c *Config) SkipVerify() bool {
+	if c.UpstreamInsecureSkipVerify == nil {
+		return DefaultUpstreamInsecureSkipVerify
+	}
+	return *c.UpstreamInsecureSkipVerify
 }
 
 // Validate 收集所有配置问题后一次性返回，避免"改一处再报一处"。

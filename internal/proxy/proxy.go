@@ -80,7 +80,7 @@ func (r *Router) build(cfg *config.Config) (*table, error) {
 		routes:             make(map[string]*Route, len(cfg.ProxyList)),
 		order:              make([]*Route, 0, len(cfg.ProxyList)),
 		timeout:            timeout,
-		insecureSkipVerify: cfg.UpstreamInsecureSkipVerify,
+		insecureSkipVerify: cfg.SkipVerify(),
 	}
 	transport := r.transport
 	if t.insecureSkipVerify {

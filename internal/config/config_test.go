@@ -57,6 +57,21 @@ func TestLoadMinimalConfigAppliesDefaults(t *testing.T) {
 	if cfg.LogFormat != DefaultLogFormat {
 		t.Errorf("log_format = %q, 期望默认值 %q", cfg.LogFormat, DefaultLogFormat)
 	}
+	if !cfg.SkipVerify() {
+		t.Error("upstream_insecure_skip_verify 未配置时应默认跳过证书校验")
+	}
+}
+
+// 显式配置 upstream_insecure_skip_verify=false 时必须保留，不能被默认值覆盖。
+func TestLoadExplicitInsecureSkipVerifyFalse(t *testing.T) {
+	path := writeTemp(t, `{"port":1,"upstream_insecure_skip_verify":false,"proxy_list":[{"name":"a","proxy_pass":"http://h"}]}`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if cfg.SkipVerify() {
+		t.Error("显式配置 upstream_insecure_skip_verify=false 后仍跳过证书校验")
+	}
 }
 
 // 仓库自带的示例配置必须始终可加载。
